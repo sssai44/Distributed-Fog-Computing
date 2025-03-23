@@ -1,0 +1,590 @@
+import uuid
+import json
+import time
+import threading
+import docker
+import requests
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
+
+# Define Task class first
+class Task:
+    """
+    Represents a task to be executed.
+    """
+    
+    def _init_(self, task_type: str, input_data: Dict, estimated_cpu: float, estimated_ram: float,
+                 estimated_gpu: float, is_divisible: bool, max_execution_time: int, assigned_nodes: List[str] = []):
+        """
+        Initialize a new task.
+        
+        Args:
+            task_type: Type of the task (e.g., "image_processing", "text_analysis")
+            input_data: Dictionary containing input data for the task
+            estimated_cpu: Estimated CPU usage (in cores)
+            estimated_ram: Estimated RAM usage (in GB)
+            estimated_gpu: Estimated GPU usage (0 for no GPU, 1 for full GPU)
+            is_divisible: Whether the task can be split and executed on multiple nodes
+            max_execution_time: Maximum execution time in seconds
+            assigned_nodes: List of node IDs assigned to the task (if already assigned)
+        """
+        self.task_id = str(uuid.uuid4())
+        self.task_type = task_type
+        self.input_data = input_data
+        self.estimated_cpu = estimated_cpu
+        self.estimated_ram = estimated_ram
+        self.estimated_gpu = estimated_gpu
+        self.is_divisible = is_divisible
+        self.max_execution_time = max_execution_time
+        self.status = "Pending"  # "Pending", "Scheduling", "Running", "Completed", "Failed"
+        self.created_at = time.time()
+        self.assigned_nodes = assigned_nodes
+        self.results = None
+    
+    def to_dict(self) -> Dict:
+        """Convert task to dictionary."""
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "input_data": self.input_data,
+            "estimated_cpu": self.estimated_cpu,
+            "estimated_ram": self.estimated_ram,
+            "estimated_gpu": self.estimated_gpu,
+            "is_divisible": self.is_divisible,
+            "max_execution_time": self.max_execution_time,
+            "status": self.status,
+            "created_at": self.created_at,
+            "assigned_nodes": self.assigned_nodes
+        }
+
+class NodeManager:
+    """
+    Manages available compute nodes.
+    """
+    
+    def _init_(self, nodes: List[Dict]):
+        """
+        Initialize NodeManager with a list of nodes.
+        
+        Args:
+            nodes: List of dictionaries, each representing a compute node
+        """
+        self.nodes = nodes
+    
+    def get_available_nodes(self, cpu: float, ram: float, gpu: float) -> List[Dict]:
+        """
+        Get a list of nodes that meet the specified resource requirements.
+        
+        Args:
+            cpu: Required CPU cores
+            ram: Required RAM in GB
+            gpu: Required GPU (0 or 1)
+            
+        Returns:
+            List of nodes that meet the requirements
+        """
+        available_nodes = [
+            node for node in self.nodes
+            if node["cpu"] >= cpu and node["ram"] >= ram and node["gpu"] >= gpu and node["active"]
+        ]
+        return available_nodes
+    
+    def get_active_nodes(self) -> List[Dict]:
+        """
+        Get a list of all active nodes.
+        
+        Returns:
+            List of active nodes
+        """
+        return [node for node in self.nodes if node["active"]]
+
+class TaskManager:
+    """
+    Manages task execution, scheduling, and resource allocation.
+    """
+    
+    def _init_(self, node_manager, local_resources: Dict, max_concurrent_tasks: int = 10):
+        """
+        Initialize the Task Manager.
+        
+        Args:
+            node_manager: Instance of NodeManager for accessing node resources
+            local_resources: Dict containing local fog device resources
+            max_concurrent_tasks: Maximum number of concurrent tasks to execute
+        """
+        self.node_manager = node_manager
+        self.local_resources = local_resources
+        self.max_concurrent_tasks = max_concurrent_tasks
+        
+        # Track running tasks and available resources
+        self.tasks = {}  # task_id -> Task object
+        self.running_tasks = 0
+        self.available_cpu = local_resources["cpu"]
+        self.available_ram = local_resources["ram"]
+        self.available_gpu = local_resources.get("gpu", 0.0)
+        
+        # Docker client for container management
+        self.docker_client = docker.from_env()
+        
+        # Thread pool for executing tasks
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent_tasks)
+        
+        # Thread for task processing
+        self.processing_thread = threading.Thread(target=self._process_task_queue, daemon=True)
+        self.processing_thread.start()
+        
+        # Task queue
+        self.task_queue = []
+        self.queue_lock = threading.Lock()
+    
+    def submit_task(self, task: Task) -> str:
+        """
+        Submit a new task for execution.
+        
+        Args:
+            task: Task object with all required parameters
+            
+        Returns:
+            task_id: Unique identifier for tracking the task
+        """
+        with self.queue_lock:
+            self.tasks[task.task_id] = task
+            self.task_queue.append(task.task_id)
+        
+        print(f"Task {task.task_id} submitted, type: {task.task_type}")
+        return task.task_id
+    
+    def get_task_status(self, task_id: str) -> Dict:
+        """
+        Get the current status of a task.
+        
+        Args:
+            task_id: The ID of the task
+            
+        Returns:
+            Dict containing task status information
+        """
+        task = self.tasks.get(task_id)
+        if not task:
+            return {"error": "Task not found"}
+        
+        result = task.to_dict()
+        if task.status == "Completed":
+            result["results"] = task.results
+        
+        return result
+    
+    def _process_task_queue(self) -> None:
+        """Background thread to process the task queue."""
+        while True:
+            try:
+                # Check if we have tasks to process and available concurrency
+                if self.task_queue and self.running_tasks < self.max_concurrent_tasks:
+                    with self.queue_lock:
+                        if self.task_queue:
+                            # Get the next task ID from the queue
+                            task_id = self.task_queue.pop(0)
+                            task = self.tasks[task_id]
+                            
+                            # Schedule the task
+                            self._schedule_task(task)
+                
+                # Sleep to avoid too much CPU usage
+                time.sleep(0.1)
+                
+            except Exception as e:
+                print(f"Error in task queue processing: {e}")
+                time.sleep(1)  # Sleep longer on error
+    
+    def _schedule_task(self, task: Task) -> None:
+        """
+        Determine where to run a task and start execution.
+        
+        Args:
+            task: The task to be scheduled
+        """
+        task.status = "Scheduling"
+        
+        # Check if we can run locally
+        if (self.available_cpu >= task.estimated_cpu and 
+            self.available_ram >= task.estimated_ram and 
+            self.available_gpu >= task.estimated_gpu):
+            
+            # Execute locally
+            print(f"Executing task {task.task_id} locally")
+            self._reserve_local_resources(task)
+            task.status = "Running"
+            self.running_tasks += 1
+            self.executor.submit(self._execute_local_task, task)
+            
+        else:
+            # Need to find external nodes
+            required_nodes = self._find_nodes_for_task(task)
+            
+            if not required_nodes:
+                # No suitable nodes found
+                task.status = "Failed"
+                print(f"No suitable nodes found for task {task.task_id}")
+                return
+            
+            # Execute on external nodes
+            task.assigned_nodes = [node["node_id"] for node in required_nodes]
+            task.status = "Running"
+            self.running_tasks += 1
+            
+            if task.is_divisible and len(required_nodes) > 1:
+                # Split task across multiple nodes
+                self.executor.submit(self._execute_distributed_task, task, required_nodes)
+            else:
+                # Execute on a single external node
+                self.executor.submit(self._execute_remote_task, task, required_nodes[0])
+    
+    def _find_nodes_for_task(self, task: Task) -> List[Dict]:
+        """
+        Find suitable nodes for a task.
+        
+        Args:
+            task: The task to find nodes for
+            
+        Returns:
+            List of suitable node dictionaries
+        """
+        # Check if task can be run on a single node
+        single_nodes = self.node_manager.get_available_nodes(
+            task.estimated_cpu, task.estimated_ram, task.estimated_gpu
+        )
+        
+        if single_nodes:
+            # Found a single node that can handle the task
+            return [single_nodes[0]]
+        
+        # If the task is divisible, try to split it
+        if task.is_divisible:
+            # Get all active nodes
+            all_active_nodes = self.node_manager.get_active_nodes()
+            
+            # Sort by available resources
+            all_active_nodes.sort(key=lambda x: (x["cpu"] + x["ram"]), reverse=True)
+            
+            # Calculate total available resources
+            total_cpu = sum(node["cpu"] for node in all_active_nodes)
+            total_ram = sum(node["ram"] for node in all_active_nodes)
+            total_gpu = sum(node["gpu"] for node in all_active_nodes)
+            
+            # Check if combined resources are enough
+            if (total_cpu >= task.estimated_cpu and 
+                total_ram >= task.estimated_ram and 
+                total_gpu >= task.estimated_gpu):
+                
+                # Determine how many nodes we need
+                selected_nodes = []
+                required_cpu = task.estimated_cpu
+                required_ram = task.estimated_ram
+                required_gpu = task.estimated_gpu
+                
+                for node in all_active_nodes:
+                    selected_nodes.append(node)
+                    required_cpu -= node["cpu"]
+                    required_ram -= node["ram"]
+                    required_gpu -= node["gpu"]
+                    
+                    if required_cpu <= 0 and required_ram <= 0 and required_gpu <= 0:
+                        break
+                
+                return selected_nodes
+        
+        # If we get here, we couldn't find suitable nodes
+        return []
+    
+    def _reserve_local_resources(self, task: Task) -> None:
+        """Reserve local resources for a task."""
+        self.available_cpu -= task.estimated_cpu
+        self.available_ram -= task.estimated_ram
+        self.available_gpu -= task.estimated_gpu
+    
+    def _release_local_resources(self, task: Task) -> None:
+        """Release local resources after task completion."""
+        self.available_cpu += task.estimated_cpu
+        self.available_ram += task.estimated_ram
+        self.available_gpu += task.estimated_gpu
+    
+    def _execute_local_task(self, task: Task) -> None:
+        """
+        Execute a task locally using Docker.
+        
+        Args:
+            task: The task to execute
+        """
+        try:
+            # Create task-specific Docker container
+            container_name = f"task-{task.task_id}"
+            
+            # Determine image based on task type
+            image = self._get_docker_image_for_task(task.task_type)
+            
+            # Create a volume to share data
+            volume_name = f"task-data-{task.task_id}"
+            volume = self.docker_client.volumes.create(volume_name)
+            
+            # Write input data to volume
+            temp_container = self.docker_client.containers.run(
+                "alpine",
+                f"sh -c 'echo \'{json.dumps(task.input_data)}\' > /data/input.json'",
+                volumes={volume_name: {"bind": "/data", "mode": "rw"}},
+                detach=True,
+                remove=True
+            )
+            temp_container.wait()
+            
+            # Run the actual task container
+            container = self.docker_client.containers.run(
+                image,
+                command=f"python /app/run.py --input /data/input.json --output /data/output.json",
+                volumes={volume_name: {"bind": "/data", "mode": "rw"}},
+                mem_limit=f"{int(task.estimated_ram * 1024)}m",
+                cpu_quota=int(task.estimated_cpu * 100000),  # Docker CPU quota is in microseconds
+                name=container_name,
+                detach=True
+            )
+            
+            # Wait for container with timeout
+            result = container.wait(timeout=task.max_execution_time)
+            
+            if result["StatusCode"] == 0:
+                # Read output from volume
+                output_container = self.docker_client.containers.run(
+                    "alpine",
+                    "cat /data/output.json",
+                    volumes={volume_name: {"bind": "/data", "mode": "ro"}},
+                    remove=True
+                )
+                output_data = output_container.decode('utf-8')
+                
+                # Parse output
+                task.results = json.loads(output_data)
+                task.status = "Completed"
+                print(f"Task {task.task_id} completed successfully")
+            else:
+                task.status = "Failed"
+                print(f"Task {task.task_id} failed with exit code {result['StatusCode']}")
+            
+            # Cleanup
+            container.remove()
+            volume.remove()
+            
+        except Exception as e:
+            task.status = "Failed"
+            print(f"Error executing task {task.task_id}: {e}")
+        
+        finally:
+            # Release resources
+            self._release_local_resources(task)
+            self.running_tasks -= 1
+    
+    def _get_docker_image_for_task(self, task_type: str) -> str:
+        """
+        Determine the appropriate Docker image for a task type.
+        
+        Args:
+            task_type: The type of the task
+            
+        Returns:
+            The Docker image name
+        """
+        # Define a mapping of task types to Docker images
+        task_image_mapping = {
+            "image_processing": "image_processing_image",
+            "text_analysis": "text_analysis_image",
+            "ml_training": "ml_training_image"
+        }
+        
+        return task_image_mapping.get(task_type, "default_task_image")
+    
+    def _execute_distributed_task(self, task: Task, nodes: List[Dict]) -> None:
+        """
+        Execute a task across multiple remote nodes.
+        
+        Args:
+            task: The task to execute
+            nodes: The list of nodes to use
+        """
+        try:
+            # Calculate portion of task for each node
+            num_nodes = len(nodes)
+            data_size = len(task.input_data)
+            chunk_size = data_size // num_nodes
+            
+            # Assign a portion of the input data to each node
+            for i, node in enumerate(nodes):
+                start_index = i * chunk_size
+                end_index = start_index + chunk_size if i < num_nodes - 1 else data_size
+                
+                # Create subtask for this portion
+                node_data = {
+                    key: task.input_data[key] for key in list(task.input_data.keys())[start_index:end_index]
+                }
+                
+                # Send subtask to the node
+                print(f"Sending subtask to node {node['node_id']}")
+                
+                # Prepare task data
+                task_data = {
+                    "task_id": f"{task.task_id}-{i}",
+                    "task_type": task.task_type,
+                    "input_data": node_data,
+                    "docker_image": self._get_docker_image_for_task(task.task_type),
+                    "max_execution_time": task.max_execution_time
+                }
+                
+                # Send subtask to node
+                self._send_task_to_remote_node(node, task_data)
+            
+            # Wait for all subtasks to complete
+            all_results = []
+            for i, node in enumerate(nodes):
+                # Get results for this subtask
+                subtask_id = f"{task.task_id}-{i}"
+                result = self._get_remote_task_result(subtask_id)
+                all_results.append(result)
+            
+            # Combine results from all subtasks
+            task.results = self._combine_results(all_results)
+            task.status = "Completed"
+            print(f"Distributed task {task.task_id} completed")
+            
+        except Exception as e:
+            task.status = "Failed"
+            print(f"Error executing distributed task {task.task_id}: {e}")
+        
+        finally:
+            self.running_tasks -= 1
+    
+    def _execute_remote_task(self, task: Task, node: Dict) -> None:
+        """
+        Execute a task on a remote node.
+        
+        Args:
+            task: The task to execute
+            node: The node to execute on
+        """
+        try:
+            # Prepare task data
+            task_data = {
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "input_data": task.input_data,
+                "docker_image": self._get_docker_image_for_task(task.task_type),
+                "max_execution_time": task.max_execution_time
+            }
+            
+            # Send task to remote node
+            result = self._send_task_to_remote_node(node, task_data)
+            
+            if result and result["status"] == "Completed":
+                task.results = result["results"]
+                task.status = "Completed"
+                print(f"Task {task.task_id} completed on remote node")
+            else:
+                task.status = "Failed"
+                print(f"Task {task.task_id} failed on remote node")
+            
+        except Exception as e:
+            task.status = "Failed"
+            print(f"Error executing remote task {task.task_id}: {e}")
+        
+        finally:
+            self.running_tasks -= 1
+    
+    def _send_task_to_remote_node(self, node: Dict, task_data: Dict) -> Dict:
+        """
+        Send a task to a remote node via HTTP.
+        
+        Args:
+            node: The remote node information
+            task_data: The task data to send
+            
+        Returns:
+            The result from the remote node
+        """
+        try:
+            # Construct the URL for the remote node's task execution endpoint
+            url = f"http://{node['ip']}:{node['port']}/execute_task"
+            
+            # Send the task data as JSON
+            response = requests.post(url, json=task_data, timeout=task_data["max_execution_time"] + 10)
+            
+            # Check the response status code
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"Remote node returned an error: {response.status_code} - {response.text}")
+                return {"status": "Failed", "error": response.text}
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error sending task to remote node: {e}")
+            return {"status": "Failed", "error": str(e)}
+    
+    def _get_remote_task_result(self, task_id: str) -> Any:
+        """
+        Retrieve the result of a task from a remote node.
+        
+        Args:
+            task_id: The ID of the task
+            
+        Returns:
+            The task result
+        """
+        # Implementation depends on how remote nodes store and serve results
+        # For now, return an empty dictionary
+        return {}
+    
+    def _combine_results(self, results: List[Any]) -> Any:
+        """
+        Combine partial results from multiple nodes into a single result.
+        
+        Args:
+            results: List of partial results
+            
+        Returns:
+            Combined result
+        """
+        # Implementation depends on the type of task and the structure of results
+        # For now, just return the list of results
+        return results
+
+
+if _name_ == "_main_":
+    # Define local resources
+    local_resources = {"cpu": 4.0, "ram": 8.0, "gpu": 1.0}
+    
+    # Create NodeManager with some example nodes
+    nodes = [
+        {"node_id": "node1", "ip": "192.168.1.100", "port": 5000, "cpu": 2.0, "ram": 4.0, "gpu": 0.0, "active": True},
+        {"node_id": "node2", "ip": "192.168.1.101", "port": 5000, "cpu": 4.0, "ram": 8.0, "gpu": 1.0, "active": True},
+        {"node_id": "node3", "ip": "192.168.1.102", "port": 5000, "cpu": 8.0, "ram": 16.0, "gpu": 0.0, "active": False}
+    ]
+    node_manager = NodeManager(nodes)
+    
+    # Create TaskManager
+    task_manager = TaskManager(node_manager, local_resources)
+    
+    # Create a task
+    task = Task(
+        task_type="image_processing",
+        input_data={"image_url": "http://example.com/image.jpg"},
+        estimated_cpu=1.0,
+        estimated_ram=2.0,
+        estimated_gpu=0.0,
+        is_divisible=False,
+        max_execution_time=60
+    )
+    
+    # Submit the task
+    task_id = task_manager.submit_task(task)
+    
+    # Get task status
+    status = task_manager.get_task_status(task_id)
+    print(f"Task status: {status}")
+    
+    # Keep the main thread alive to allow task processing
+    time.sleep(10)
